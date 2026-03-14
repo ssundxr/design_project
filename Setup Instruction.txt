@@ -1,0 +1,29 @@
+Run Locally
+python -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
+uvicorn main:app --reload
+API Docs
+Swagger UI: http://127.0.0.1:8000/docs
+ReDoc: http://127.0.0.1:8000/redoc
+Main Endpoints
+GET /health
+POST /api/v1/redact/image
+POST /api/v1/redact/pdf
+Notes
+Tesseract is used as OCR fallback and should be installed on host machines.
+PDF processing uses PyMuPDF (pymupdf) for page rendering and word-level extraction, then Gemini selects only PII tokens for redaction.
+Generated files are written under output/.
+Project Structure
+src/
+  api/
+    main.py
+    schemas.py
+  detector.py
+  gemini_orchestrator.py
+  layoutlm_detector.py
+  ocr.py
+  pdf_redactor.py
+  redactor.py
+main.py
+requirements.txt
