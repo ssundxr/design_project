@@ -16,15 +16,13 @@ logger = logging.getLogger(__name__)
 
 # Try importing PDF libraries
 try:
-    from pdf2image import convert_from_path
-    import pdf2image.exceptions
-    PDF2IMAGE_AVAILABLE = True
+    import fitz  # PyMuPDF
+    PDF_ENGINE_AVAILABLE = True
 except ImportError:
-    PDF2IMAGE_AVAILABLE = False
-    logger.warning("pdf2image not available - install: pip install pdf2image")
+    PDF_ENGINE_AVAILABLE = False
+    logger.warning("PyMuPDF not available - install: pip install pymupdf")
 
 try:
-    from PIL import Image
     import img2pdf
     IMG2PDF_AVAILABLE = True
 except ImportError:
@@ -32,7 +30,7 @@ except ImportError:
     logger.warning("img2pdf not available - install: pip install img2pdf")
 
 # Import redactor
-from redactor import PIIRedactor
+from .redactor import PIIRedactor
 
 
 class PDFRedactor:
@@ -89,8 +87,8 @@ class PDFRedactor:
         Returns:
             Tuple of (output_pdf_path, audit_data)
         """
-        if not PDF2IMAGE_AVAILABLE:
-            raise Exception("pdf2image not installed. Run: pip install pdf2image")
+        if not PDF_ENGINE_AVAILABLE:
+            raise Exception("pymupdf not installed. Run: pip install pymupdf")
         
         if not IMG2PDF_AVAILABLE:
             raise Exception("img2pdf not installed. Run: pip install img2pdf")
@@ -118,14 +116,14 @@ class PDFRedactor:
         }
         
         try:
-            # Step 1: Convert PDF to images
+            # Step 1: Extract PDF pages (image + words)
             if progress_callback:
-                progress_callback(0, 0, "Converting PDF to images...")
+                progress_callback(0, 0, "Extracting PDF pages...")
             
-            logger.info("\n[1/3] Converting PDF to images...")
-            images = self._convert_pdf_to_images(pdf_path, dpi)
+            logger.info("\n[1/3] Extracting PDF pages (PyMuPDF)...")
+            page_payloads = self._extract_pdf_pages(pdf_path, dpi)
             
-            total_pages = len(images)
+            total_pages = len(page_payloads)
             audit_data['total_pages'] = total_pages
             
             if total_pages == 0:
@@ -136,36 +134,57 @@ class PDFRedactor:
             
             logger.info(f"✓ Converted {total_pages} pages")
             
-            # Step 2: Redact each page
-            logger.info(f"\n[2/3] Redacting {total_pages} pages...")
-            redacted_images = []
+            # Step 2: Redact each page (PARALLELIZED)
+            logger.info(f"\n[2/3] Redacting {total_pages} pages in parallel...")
+            redacted_images = [None] * total_pages
             
-            for page_num, image in enumerate(images, 1):
-                if progress_callback:
-                    progress_callback(page_num, total_pages, f"Redacting page {page_num}/{total_pages}")
-                
-                logger.info(f"\n--- Page {page_num}/{total_pages} ---")
-                
-                # Redact page
-                redacted_img, page_audit = self.redactor.redact_image(
-                    image,
-                    filename=f"{pdf_path.stem}_page_{page_num}.jpg",
-                    generate_audit=False
-                )
-                
-                redacted_images.append(redacted_img)
-                
-                # Store page audit
-                page_summary = {
-                    'page_number': page_num,
-                    'detections': len(page_audit['detections']),
-                    'statistics': page_audit['statistics'],
-                    'risk_assessment': page_audit.get('risk_assessment', 'N/A')
+            import concurrent.futures
+            
+            def process_page(page_idx_and_payload):
+                idx, img, words_with_boxes = page_idx_and_payload
+                page_n = idx + 1
+                logger.info(f"--- Started Page {page_n}/{total_pages} ---")
+                try:
+                    r_img, p_audit = self.redactor.redact_image(
+                        img,
+                        filename=f"{pdf_path.stem}_page_{page_n}.jpg",
+                        generate_audit=False,
+                        words_with_boxes=words_with_boxes
+                    )
+                    return idx, r_img, p_audit
+                except Exception as e:
+                    logger.error(f"Error on page {page_n}: {e}")
+                    return idx, img, {'detections': [], 'statistics': {}}
+            
+            completed = 0
+            # Use max 4 workers to balance memory usage vs speed
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                futures = {
+                    executor.submit(process_page, (i, payload[0], payload[1])): i
+                    for i, payload in enumerate(page_payloads)
                 }
-                audit_data['pages'].append(page_summary)
-                audit_data['total_detections'] += len(page_audit['detections'])
                 
-                logger.info(f"✓ Page {page_num}: {len(page_audit['detections'])} detections")
+                for future in concurrent.futures.as_completed(futures):
+                    idx, r_img, p_audit = future.result()
+                    redacted_images[idx] = r_img
+                    
+                    page_n = idx + 1
+                    completed += 1
+                    
+                    if progress_callback:
+                        progress_callback(completed, total_pages, f"Redacting page {completed}/{total_pages}")
+                    
+                    # Store page audit
+                    page_summary = {
+                        'page_number': page_n,
+                        'detections': len(p_audit.get('detections', [])),
+                        'statistics': p_audit.get('statistics', {}),
+                        'risk_assessment': p_audit.get('risk_assessment', 'N/A')
+                    }
+                    audit_data['pages'].append(page_summary)
+                    audit_data['total_detections'] += len(p_audit.get('detections', []))
+                    
+                    logger.info(f"✓ Page {page_n}: {len(p_audit.get('detections', []))} detections")
             
             # Step 3: Convert back to PDF
             if progress_callback:
@@ -208,68 +227,41 @@ class PDFRedactor:
             logger.error(f"PDF redaction failed: {e}")
             raise
     
-    def _convert_pdf_to_images(self, pdf_path: Path, dpi: int) -> List[Image.Image]:
+    def _extract_pdf_pages(self, pdf_path: Path, dpi: int) -> List[Tuple[Image.Image, List[Tuple[str, Tuple[int, int, int, int]]]]]:
         """
-        Convert PDF to list of PIL Images.
-        
-        Args:
-            pdf_path: Path to PDF file
-            dpi: Resolution for conversion
-            
-        Returns:
-            List of PIL Images (one per page)
+        Extract each PDF page as an image and word-level bounding boxes using PyMuPDF.
         """
+        doc = None
+        payloads: List[Tuple[Image.Image, List[Tuple[str, Tuple[int, int, int, int]]]]] = []
         try:
-            # Try to find poppler in common locations
-            import os
-            import shutil
-            
-            poppler_path = None
-            
-            # Check if poppler is in PATH
-            if shutil.which("pdftoppm") is not None:
-                poppler_path = None  # Use system PATH
-            else:
-                # Check common Windows locations
-                common_paths = [
-                    r"C:\Program Files\poppler\Library\bin",
-                    r"C:\Program Files\poppler-24.08.0\Library\bin",
-                    r"C:\Program Files (x86)\poppler\Library\bin",
-                    r"C:\poppler\Library\bin",
-                    os.path.join(os.getcwd(), "poppler", "Library", "bin"),
-                    os.path.join(os.getcwd(), "poppler-25.07.0", "Library", "bin"),
-                ]
-                
-                for path in common_paths:
-                    if os.path.exists(path) and os.path.exists(os.path.join(path, "pdftoppm.exe")):
-                        poppler_path = path
-                        logger.info(f"Found poppler at: {poppler_path}")
-                        break
-            
-            images = convert_from_path(
-                str(pdf_path),
-                dpi=dpi,
-                fmt='png',
-                thread_count=4,  # Parallel processing
-                grayscale=False,
-                poppler_path=poppler_path
-            )
-            return images
-        except pdf2image.exceptions.PDFPageCountError as e:
-            logger.error(f"Invalid PDF: {e}")
-            raise Exception("Invalid or corrupted PDF file")
-        except pdf2image.exceptions.PDFInfoNotInstalledError as e:
-            logger.error(f"Poppler not found: {e}")
-            raise Exception(
-                "Poppler not found! Please install:\n"
-                "1. Download from: https://github.com/oschwartz10612/poppler-windows/releases\n"
-                "2. Extract to C:\\Program Files\\poppler\n"
-                "3. Add to PATH: C:\\Program Files\\poppler\\Library\\bin\n"
-                "OR place poppler folder in project directory"
-            )
+            doc = fitz.open(str(pdf_path))
+            scale = max(dpi / 72.0, 0.1)
+            matrix = fitz.Matrix(scale, scale)
+
+            for page in doc:
+                pix = page.get_pixmap(matrix=matrix, alpha=False)
+                image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+                words_with_boxes: List[Tuple[str, Tuple[int, int, int, int]]] = []
+                for item in page.get_text("words"):
+                    x0, y0, x1, y1, text = item[:5]
+                    text = str(text).strip()
+                    if not text:
+                        continue
+                    sx0, sy0, sx1, sy1 = int(x0 * scale), int(y0 * scale), int(x1 * scale), int(y1 * scale)
+                    w = max(1, sx1 - sx0)
+                    h = max(1, sy1 - sy0)
+                    words_with_boxes.append((text, (sx0, sy0, w, h)))
+
+                payloads.append((image, words_with_boxes))
+
+            return payloads
         except Exception as e:
-            logger.error(f"PDF conversion failed: {e}")
-            raise Exception(f"Failed to convert PDF: {e}")
+            logger.error(f"PDF extraction failed: {e}")
+            raise Exception(f"Failed to extract PDF pages: {e}")
+        finally:
+            if doc is not None:
+                doc.close()
     
     def _convert_images_to_pdf(self, images: List[Image.Image], output_path: Path):
         """
@@ -351,6 +343,8 @@ class PDFRedactor:
             
             with open(audit_file, 'w', encoding='utf-8') as f:
                 json.dump(audit_data, f, indent=2, ensure_ascii=False)
+            audit_data['audit_file'] = audit_file.name
+            audit_data['audit_path'] = str(audit_file)
             
             logger.info(f"✓ PDF audit saved: {audit_file.name}")
         except Exception as e:
@@ -360,7 +354,7 @@ class PDFRedactor:
         """Get PDF redactor information."""
         return {
             'max_pages': self.MAX_PAGES,
-            'pdf2image_available': PDF2IMAGE_AVAILABLE,
+            'pdf_engine_available': PDF_ENGINE_AVAILABLE,
             'img2pdf_available': IMG2PDF_AVAILABLE,
             'output_directory': str(self.pdf_output_dir),
             'audit_directory': str(self.pdf_audit_dir)

@@ -1,16 +1,20 @@
 torch>=2.0.0
 torchvision>=0.15.0
 transformers>=4.30.0
+datasets>=2.12.0
 ultralytics>=8.0.0
 pillow>=10.0.0
 opencv-python>=4.8.0
 pytesseract>=0.3.10
 numpy>=1.24.0
-fuzzywuzzy>=0.18.0  # For PII fuzzy matching
-flower==2.0.1
-opacus==1.4.0
-shap==0.49.1
 cryptography==42.0.8
-pdf2image>=1.17.0  # PDF to image conversion
+pymupdf>=1.24.0  # PDF page rendering + word-level extraction
 img2pdf>=0.5.1  # Image to PDF conversion
 spacy>=3.7.0
+python-dotenv>=1.0.0  # Environment variable management
+paddlepaddle>=2.6.0  # Required for Localizer PaddleOCR
+paddleocr>=2.8.1  # High-speed multilingual 22+ language OCR
+easyocr>=1.7.2  # Pure-Python OCR fallback
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9

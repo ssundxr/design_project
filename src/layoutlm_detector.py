@@ -5,11 +5,21 @@ Version: 2.0 Enterprise
 """
 
 from typing import List, Dict, Any, Tuple
-import pytesseract
 import logging
 from PIL import Image
-import torch
 import numpy as np
+
+try:
+    import pytesseract
+    TESSERACT_BINDING_AVAILABLE = True
+except ImportError:
+    TESSERACT_BINDING_AVAILABLE = False
+
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +27,7 @@ logger = logging.getLogger(__name__)
 try:
     from transformers import LayoutLMv3ImageProcessor, LayoutLMv3ForTokenClassification
     from datasets import Features, Sequence, ClassLabel, Value, Array2D
-    LAYOUTLM_AVAILABLE = True
+    LAYOUTLM_AVAILABLE = TORCH_AVAILABLE and TESSERACT_BINDING_AVAILABLE
 except ImportError:
     LAYOUTLM_AVAILABLE = False
     logger.warning("LayoutLM not available. Install: pip install transformers datasets")
@@ -52,7 +62,7 @@ class LayoutLMDetector:
         self.model_name = model_name
         self.processor = None
         self.model = None
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu") if TORCH_AVAILABLE else "cpu"
         
         if not LAYOUTLM_AVAILABLE:
             logger.error("LayoutLM dependencies not available")
@@ -94,7 +104,7 @@ class LayoutLMDetector:
                 config='--psm 6'
             )
             
-            words, boxes = self._parse_tesseract_output(data)
+            words, norm_boxes, pixel_boxes = self._parse_tesseract_output(data)
             
             if not words:
                 return []
@@ -103,7 +113,7 @@ class LayoutLMDetector:
             encoding = self.processor(
                 image,
                 text=words,
-                boxes=boxes,
+                boxes=norm_boxes,
                 return_tensors="pt",
                 padding="max_length",
                 truncation=True
@@ -122,7 +132,7 @@ class LayoutLMDetector:
             
             # Parse predictions
             detections = []
-            for i, (word, box, pred, conf) in enumerate(zip(words, boxes, predictions, confidences)):
+            for i, (word, pbox, pred, conf) in enumerate(zip(words, pixel_boxes, predictions, confidences)):
                 # Skip padding and low confidence
                 if word == "[PAD]" or conf < confidence_threshold:
                     continue
@@ -131,11 +141,11 @@ class LayoutLMDetector:
                 entity_label = self._map_prediction_to_entity(pred)
                 
                 if entity_label in self.PII_ENTITIES:
-                    x_min, y_min, x_max, y_max = box
+                    x_min, y_min, x_max, y_max = pbox
                     detections.append({
                         'entity': entity_label,
                         'text': word,
-                        'bbox': [x_min, y_min, x_max - x_min, y_max - y_min],
+                        'bbox': [int(x_min), int(y_min), int(x_max), int(y_max)],
                         'confidence': float(conf),
                         'risk': self._assess_risk(entity_label)
                     })
@@ -147,13 +157,17 @@ class LayoutLMDetector:
             logger.error(f"Structured detection failed: {e}")
             return []
     
-    def _parse_tesseract_output(self, data: dict) -> Tuple[List[str], List[List[int]]]:
-        """Parse Tesseract output into words and normalized bounding boxes."""
+    def _parse_tesseract_output(self, data: dict) -> Tuple[List[str], List[List[int]], List[List[int]]]:
+        """Parse Tesseract output into words with normalized and pixel boxes."""
         words = []
-        boxes = []
+        norm_boxes = []
+        pixel_boxes = []
         
-        img_width = max(data['left']) + max(data['width'])
-        img_height = max(data['top']) + max(data['height'])
+        if not data.get('text'):
+            return words, norm_boxes, pixel_boxes
+
+        img_width = max(1, max(data['left']) + max(data['width']))
+        img_height = max(1, max(data['top']) + max(data['height']))
         
         n = len(data['text'])
         for i in range(n):
@@ -164,11 +178,16 @@ class LayoutLMDetector:
                 y = int((data['top'][i] / img_height) * 1000)
                 x_max = int(((data['left'][i] + data['width'][i]) / img_width) * 1000)
                 y_max = int(((data['top'][i] + data['height'][i]) / img_height) * 1000)
+                px1 = int(data['left'][i])
+                py1 = int(data['top'][i])
+                px2 = int(data['left'][i] + data['width'][i])
+                py2 = int(data['top'][i] + data['height'][i])
                 
                 words.append(text)
-                boxes.append([x, y, x_max, y_max])
+                norm_boxes.append([x, y, x_max, y_max])
+                pixel_boxes.append([px1, py1, px2, py2])
         
-        return words, boxes
+            return words, norm_boxes, pixel_boxes
     
     def _map_prediction_to_entity(self, pred: int) -> str:
         """Map model prediction ID to entity label."""
@@ -198,7 +217,10 @@ class LayoutLMDetector:
     
     def _fallback_detection(self, image: Image.Image) -> List[Dict[str, Any]]:
         """Fallback to pattern-based detection if LayoutLM unavailable."""
-        from detector import detect_pii_patterns
+        try:
+            from .detector import detect_pii_patterns
+        except ImportError:
+            from detector import detect_pii_patterns
         
         try:
             text = pytesseract.image_to_string(image)

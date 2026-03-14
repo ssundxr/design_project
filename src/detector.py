@@ -8,8 +8,13 @@ from typing import List, Tuple, Dict, Any
 from PIL import Image, ImageDraw
 import logging
 import numpy as np
-import torch
 import re
+
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -475,7 +480,7 @@ class VisualPIIDetector:
     
     def __init__(self, use_gpu: bool = True, model_path: str = None):
         """Initialize all detectors."""
-        self.use_gpu = use_gpu and torch.cuda.is_available()
+        self.use_gpu = use_gpu and TORCH_AVAILABLE and torch.cuda.is_available()
         self.device = 'cuda' if self.use_gpu else 'cpu'
         self.model = None
         self.signature_detector = SignatureDetector()
@@ -530,10 +535,18 @@ class VisualPIIDetector:
         return boxes
     
     def _detect_yolo(self, image: Image.Image) -> List[Tuple[int, int, int, int]]:
-        """YOLO detection."""
+        """YOLO detection (Optimized for speed)."""
         try:
             img_array = np.array(image)
-            results = self.model(img_array, conf=0.25, verbose=False, classes=[0])
+            # Optimize inference speed: downscale to 320 and use FP16 on GPU
+            results = self.model(
+                img_array, 
+                conf=0.25, 
+                verbose=False, 
+                classes=[0], 
+                imgsz=320, 
+                half=True if getattr(self, 'use_gpu', False) else False
+            )
             
             boxes = []
             if results and len(results) > 0:
@@ -598,6 +611,83 @@ class VisualPIIDetector:
                 'risk': 'MEDIUM'
             })
         
+        return detections
+
+
+class StampDetector:
+    """Heuristic stamp detector (seal-like circular/elliptic high-saturation regions)."""
+
+    def detect(self, image: Image.Image) -> List[Dict[str, Any]]:
+        if not OPENCV_AVAILABLE:
+            return []
+
+        detections: List[Dict[str, Any]] = []
+        try:
+            bgr = cv2.cvtColor(np.array(image.convert('RGB')), cv2.COLOR_RGB2BGR)
+            hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+
+            # Typical ink stamp hues: red/blue ranges with moderate saturation.
+            red1 = cv2.inRange(hsv, (0, 50, 40), (12, 255, 255))
+            red2 = cv2.inRange(hsv, (165, 50, 40), (180, 255, 255))
+            blue = cv2.inRange(hsv, (90, 40, 40), (135, 255, 255))
+            mask = cv2.bitwise_or(cv2.bitwise_or(red1, red2), blue)
+
+            kernel = np.ones((3, 3), np.uint8)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for c in contours:
+                area = cv2.contourArea(c)
+                if area < 1200:
+                    continue
+                x, y, w, h = cv2.boundingRect(c)
+                if w < 35 or h < 35:
+                    continue
+                aspect = w / max(h, 1)
+                if aspect < 0.5 or aspect > 2.0:
+                    continue
+                detections.append({'bbox': (x, y, w, h), 'confidence': 0.7, 'type': 'STAMP'})
+        except Exception as e:
+            logger.error(f"Stamp detection failed: {e}")
+
+        return detections
+
+
+class FingerprintDetector:
+    """Heuristic fingerprint detector using ridge-like texture density."""
+
+    def detect(self, image: Image.Image) -> List[Dict[str, Any]]:
+        if not OPENCV_AVAILABLE:
+            return []
+
+        detections: List[Dict[str, Any]] = []
+        try:
+            gray = cv2.cvtColor(np.array(image.convert('RGB')), cv2.COLOR_RGB2GRAY)
+            blur = cv2.GaussianBlur(gray, (3, 3), 0)
+            edges = cv2.Canny(blur, 60, 140)
+            kernel = np.ones((3, 3), np.uint8)
+            edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for c in contours:
+                area = cv2.contourArea(c)
+                if area < 800 or area > 25000:
+                    continue
+                x, y, w, h = cv2.boundingRect(c)
+                if w < 25 or h < 25:
+                    continue
+                aspect = w / max(h, 1)
+                if aspect < 0.6 or aspect > 1.7:
+                    continue
+                roi = edges[y:y + h, x:x + w]
+                if roi.size == 0:
+                    continue
+                density = float(np.count_nonzero(roi)) / float(roi.size)
+                if 0.10 <= density <= 0.45:
+                    detections.append({'bbox': (x, y, w, h), 'confidence': 0.65, 'type': 'FINGERPRINT'})
+        except Exception as e:
+            logger.error(f"Fingerprint detection failed: {e}")
+
         return detections
 
 
